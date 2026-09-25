@@ -323,6 +323,26 @@ button.ghost-mini {
   border-radius: 4px; font-size: 11px; font-weight: 600;
   background: #e0e7ff; color: #3730a3;
 }
+.stock-table .status-badge {
+  display: inline-block; padding: 1px 8px; border-radius: 999px;
+  font-size: 11px; font-weight: 600;
+}
+.stock-table .status-confirmed { background: #d1fae5; color: #065f46; }
+.stock-table .status-voided { background: #fee2e2; color: #991b1b; }
+.stock-table tr.voided-row { color: var(--muted); }
+.stock-table tr.voided-row td:first-child { text-decoration: line-through; }
+.stock-table .time-line { white-space: nowrap; }
+.stock-table .void-time { color: #991b1b; }
+.stock-table .return-line {
+  margin-top: 2px; font-size: 11px; color: #065f46; font-weight: 600;
+}
+.stock-table .voided-note { font-size: 11px; color: #991b1b; white-space: nowrap; }
+.void-btn {
+  padding: 3px 9px; font-size: 12px; border-radius: 5px; cursor: pointer;
+  border: 1px solid #fca5a5; background: #fff; color: #b91c1c;
+}
+.void-btn:hover:not(:disabled) { background: #fef2f2; }
+.void-btn:disabled { opacity: 0.5; cursor: default; }
 
 .req-result {
   margin-top: 10px; padding: 9px 11px; border-radius: 7px;

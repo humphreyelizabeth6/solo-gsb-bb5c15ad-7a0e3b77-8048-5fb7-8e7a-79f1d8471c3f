@@ -23,6 +23,7 @@ from .models import (
     LayoutResponse,
     RequisitionConfirmRequest,
     RequisitionResult,
+    RequisitionVoidRequest,
     ReprintRequest,
     StockItem,
     StockRegisterRequest,
@@ -30,10 +31,12 @@ from .models import (
 )
 from .stock import (
     StockConflict,
+    RequisitionNotFound,
     confirm_requisition,
     list_requisitions,
     list_stock,
     register_stock,
+    void_requisition,
 )
 from .svg import build_calibration_page, build_reprint_svg, build_svg, resolve_reprint_selection
 
@@ -43,7 +46,7 @@ _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 # 由 SQLite 写锁 + BEGIN IMMEDIATE 保证领料事务的并发正确
 init_db()
 
-app = FastAPI(title="小批量标签拼版工具", version="1.4.0")
+app = FastAPI(title="小批量标签拼版工具", version="1.5.0")
 
 
 @app.get("/health", tags=["meta"])
@@ -197,6 +200,7 @@ def api_requisition_confirm(
 
     - 同单号 + 同参数重试：返回原记录（reused=true，HTTP 200），不重复扣纸；
     - 同单号但参数变化：HTTP 409 冲突，不扣纸；
+    - 单号已作废：HTTP 409，作废后的单号不能再次用于确认领料；
     - 标签未全部排入：HTTP 400；
     - 纸型未登记 / 尺寸不匹配 / 余量不足：HTTP 409，错误信息给出
       所需页数与当前余量。
@@ -231,8 +235,40 @@ def api_requisition_list(
     limit: int = Query(10, ge=1, le=100, description="返回最近多少条"),
     conn: sqlite3.Connection = Depends(db_session),
 ) -> list[RequisitionResult]:
-    """近期领料记录（最新在前）。"""
+    """近期领料记录（最新在前，含 confirmed / voided 状态与作废信息）。"""
     return [RequisitionResult(**r) for r in list_requisitions(conn, limit)]
+
+
+@app.post(
+    "/api/requisitions/void",
+    response_model=RequisitionResult,
+    tags=["stock"],
+)
+def api_requisition_void(
+    req: RequisitionVoidRequest,
+    conn: sqlite3.Connection = Depends(db_session),
+) -> JSONResponse:
+    """作废已确认领料单并退纸：按原单**实际扣纸页数**返还对应纸型。
+
+    作废时间与返还张数写回原单（原单号、原扣纸快照保留），库存回补与
+    状态变更在同一个 SQLite 事务中完成。
+
+    - 首次作废：HTTP 200，库存按 pages_required 张回补；
+    - 重复点击 / 并发作废同一单号：只有第一次真正返还，其余返回
+      HTTP 200 + 原作废记录（already_voided=true），不重复返还；
+    - 单号不存在：HTTP 404；
+    - 作废后的单号不能再用于确认领料（确认接口返回 HTTP 409）。
+    """
+    if not req.order_no.strip():
+        raise HTTPException(status_code=400, detail="领料单号不能为空。")
+    try:
+        result = void_requisition(conn, req.order_no)
+    except RequisitionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return JSONResponse(
+        content=RequisitionResult(**result).model_dump(),
+        status_code=200,
+    )
 
 
 # 静态资源（index.html / app.js / style.css）

@@ -650,7 +650,153 @@ def main() -> int:
     fuzzy = register_stock(test_conn, 40.004, 40.0, 1)
     assert fuzzy.paper_width == 40.0 and fuzzy.quantity == 1
 
+    # ---- 领料单作废与退纸 ----
+    from .stock import (
+        RequisitionNotFound,
+        void_requisition,
+    )
+
+    # 现状：余量 1（上面模糊登记），最近一条记录 LL-005 已扣 3 张至 0
+    assert list_stock(test_conn)[0].quantity == 1
+
+    # 作废 LL-005：按原单实际扣纸页数 3 返还，余量 1 → 4，
+    # 原记录写入作废时间、返还张数与回补快照，状态变 voided
+    vres = void_requisition(test_conn, "LL-005")
+    assert vres["status"] == "voided" and vres["already_voided"] is False
+    assert vres["returned_pages"] == 3
+    assert vres["restock_before"] == 1 and vres["restock_after"] == 4
+    assert vres["voided_at"] and vres["voided_at"] >= vres["created_at"]
+    # 原单的扣纸快照保留不变
+    assert vres["stock_before"] == 3 and vres["stock_after"] == 0
+    assert list_stock(test_conn)[0].quantity == 4
+
+    # 近期记录带上状态与作废信息，且顺序不变
+    records = list_requisitions(test_conn)
+    by_no = {r["order_no"]: r for r in records}
+    assert by_no["LL-005"]["status"] == "voided"
+    assert by_no["LL-005"]["returned_pages"] == 3
+    assert by_no["LL-005"]["restock_after"] == 4
+    assert by_no["LL-001"]["status"] == "confirmed"
+    assert by_no["LL-001"]["voided_at"] is None
+    assert by_no["LL-001"]["returned_pages"] == 0
+
+    # 重复作废同一单：不二次返还，返回原作废记录（already_voided=True）
+    vagain = void_requisition(test_conn, "LL-005")
+    assert vagain["status"] == "voided" and vagain["already_voided"] is True
+    assert vagain["voided_at"] == vres["voided_at"]
+    assert vagain["returned_pages"] == 3
+    assert list_stock(test_conn)[0].quantity == 4
+    assert len(list_requisitions(test_conn)) == 2
+
+    # 作废后的单号不能再次用于确认领料（即使参数与原单完全相同）
+    try:
+        confirm_requisition(test_conn, "LL-005", req_stock)
+    except StockConflict as exc:
+        assert "已作废" in str(exc), str(exc)
+    else:
+        raise AssertionError("已作废单号被再次用于确认领料")
+    assert list_stock(test_conn)[0].quantity == 4  # 未发生任何扣纸
+
+    # 作废不存在的单号：明确 404 式错误
+    try:
+        void_requisition(test_conn, "LL-NO-SUCH")
+    except RequisitionNotFound as exc:
+        assert "不存在" in str(exc), str(exc)
+    else:
+        raise AssertionError("作废不存在的单号应报错")
+    assert list_stock(test_conn)[0].quantity == 4
+
+    # 作废 LL-001：同样返还 3 张，余量 4 → 7
+    v1 = void_requisition(test_conn, "LL-001")
+    assert v1["status"] == "voided" and v1["returned_pages"] == 3
+    assert v1["restock_before"] == 4 and v1["restock_after"] == 7
+    assert list_stock(test_conn)[0].quantity == 7
+
     test_conn.close()
+
+    # ---- 并发作废：两个连接同时作废同一单号，纸张只返还一次 ----
+    import tempfile
+    import threading
+    from .db import connect as db_connect_file, init_db
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = f"{tmpdir}/concurrent_void.db"
+        init_db(db_file)
+        c1 = db_connect_file(db_file)
+        c2 = db_connect_file(db_file)
+        register_stock(c1, 40, 40, 5)
+        confirm_requisition(c1, "LL-C", req_stock)  # 扣 3 张，余 2
+        assert list_stock(c1)[0].quantity == 2
+
+        outcomes: list[dict] = []
+        errors: list[Exception] = []
+
+        def _worker(conn: sqlite3.Connection) -> None:
+            try:
+                outcomes.append(void_requisition(conn, "LL-C"))
+            except Exception as exc:  # noqa: BLE001 - 测试需收集线程异常
+                errors.append(exc)
+
+        t1 = threading.Thread(target=_worker, args=(c1,))
+        t2 = threading.Thread(target=_worker, args=(c2,))
+        t1.start(); t2.start(); t1.join(); t2.join()
+        assert not errors, errors
+        assert len(outcomes) == 2
+        assert all(r["status"] == "voided" for r in outcomes)
+        # 恰好一次真实返还，一次幂等返回
+        assert sorted(r["already_voided"] for r in outcomes) == [False, True]
+        real = next(r for r in outcomes if not r["already_voided"])
+        assert real["restock_before"] == 2 and real["restock_after"] == 5
+        # 库存只增加 3 张，绝不是 6 张
+        assert list_stock(c1)[0].quantity == 5
+        c1.close(); c2.close()
+
+    # ---- 老版本数据库迁移：旧结构建库后补列，旧记录视为已确认 ----
+    with tempfile.TemporaryDirectory() as tmpdir:
+        legacy_file = f"{tmpdir}/legacy.db"
+        legacy = db_connect_file(legacy_file)
+        legacy.executescript(
+            """
+            CREATE TABLE paper_stock (
+                paper_width REAL NOT NULL, paper_height REAL NOT NULL,
+                quantity INTEGER NOT NULL CHECK (quantity >= 0),
+                updated_at TEXT,
+                PRIMARY KEY (paper_width, paper_height)
+            );
+            CREATE TABLE requisitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_no TEXT NOT NULL UNIQUE,
+                paper_width REAL NOT NULL, paper_height REAL NOT NULL,
+                pages_required INTEGER NOT NULL,
+                labels_requested INTEGER NOT NULL, labels_placed INTEGER NOT NULL,
+                stock_before INTEGER NOT NULL, stock_after INTEGER NOT NULL,
+                params_json TEXT NOT NULL, params_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO paper_stock VALUES (40.0, 40.0, 2, '2026-09-01T00:00:00');
+            INSERT INTO requisitions (
+                order_no, paper_width, paper_height, pages_required,
+                labels_requested, labels_placed, stock_before, stock_after,
+                params_json, params_hash, created_at
+            ) VALUES ('LL-OLD', 40.0, 40.0, 3, 10, 10, 5, 2, '{}', 'x',
+                      '2026-09-01T00:00:00');
+            """
+        )
+        legacy.close()
+        migrated = db_connect_file(legacy_file)
+        create_schema(migrated)  # 触发增量 ALTER
+        old = migrated.execute(
+            "SELECT * FROM requisitions WHERE order_no = 'LL-OLD'"
+        ).fetchone()
+        assert old["status"] == "confirmed"
+        assert old["returned_pages"] == 0 and old["voided_at"] is None
+        assert old["restock_before"] is None and old["restock_after"] is None
+        # 迁移后的旧记录可正常作废退纸：2 + 3 = 5
+        mold = void_requisition(migrated, "LL-OLD")
+        assert mold["status"] == "voided" and mold["returned_pages"] == 3
+        assert mold["restock_after"] == 5
+        assert list_stock(migrated)[0].quantity == 5
+        migrated.close()
 
 
     print(f"[bootstrap] 自检通过（FastAPI {fastapi.__version__}, "

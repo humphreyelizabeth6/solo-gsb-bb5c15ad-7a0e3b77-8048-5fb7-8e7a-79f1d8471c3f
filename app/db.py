@@ -42,9 +42,27 @@ CREATE TABLE IF NOT EXISTS requisitions (
     stock_after      INTEGER NOT NULL,
     params_json      TEXT    NOT NULL,
     params_hash      TEXT    NOT NULL,
-    created_at       TEXT    NOT NULL
+    created_at       TEXT    NOT NULL,
+    status           TEXT    NOT NULL DEFAULT 'confirmed',
+    voided_at        TEXT,
+    returned_pages   INTEGER NOT NULL DEFAULT 0 CHECK (returned_pages >= 0),
+    restock_before   INTEGER,
+    restock_after    INTEGER
 );
 """
+
+# 老版本数据库（无作废功能）的增量迁移列：逐列 ALTER 补齐，
+# 已有领料记录自动视为「已确认」（status=confirmed、未返还纸张）。
+_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("status", "ALTER TABLE requisitions ADD COLUMN status TEXT NOT NULL DEFAULT 'confirmed'"),
+    ("voided_at", "ALTER TABLE requisitions ADD COLUMN voided_at TEXT"),
+    (
+        "returned_pages",
+        "ALTER TABLE requisitions ADD COLUMN returned_pages INTEGER NOT NULL DEFAULT 0",
+    ),
+    ("restock_before", "ALTER TABLE requisitions ADD COLUMN restock_before INTEGER"),
+    ("restock_after", "ALTER TABLE requisitions ADD COLUMN restock_after INTEGER"),
+)
 
 
 def db_path() -> Path:
@@ -73,14 +91,25 @@ def connect(database: str | Path | None = None) -> sqlite3.Connection:
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
-    """创建库存表与领料记录表（幂等）。
+    """创建库存表与领料记录表（幂等），并把老版本库迁移到最新结构。
 
     paper_stock 以（纸宽, 纸高）为业务主键，quantity 为当前余量；
     requisitions 以领料单号 order_no 为唯一键（幂等重试的核心），
     params_json 保存规范化后的请求参数，params_hash 为其指纹，
     stock_before/after 记录扣减前后的余量快照。
+
+    作废相关列 status / voided_at / returned_pages 通过逐列 ALTER 补到
+    旧库上：PRAGMA table_info 探测后只补缺失列，已有记录保持
+    status='confirmed'、returned_pages=0，与新增功能完全兼容。
     """
     conn.executescript(_SCHEMA)
+    existing = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(requisitions)").fetchall()
+    }
+    for column, ddl in _MIGRATION_COLUMNS:
+        if column not in existing:
+            conn.execute(ddl)
 
 
 def init_db(database: str | Path | None = None) -> None:

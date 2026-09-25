@@ -144,7 +144,9 @@
       <p class="hint">按<strong>纸宽 × 纸高</strong>（毫米，精确到 0.01mm）登记纸张余量；
         确认领料时服务端用<strong>左侧当前拼版参数重新计算拼版</strong>，仅当所有标签全部排入、
         且纸张尺寸与库存纸型<strong>完全一致</strong>（宽、高方向都要相同，不自动旋转纸型）时，
-        才按实际页数从余量中扣纸并写入领料记录。同一领料单号重试不会重复扣纸。</p>
+        才按实际页数从余量中扣纸并写入领料记录。同一领料单号重试不会重复扣纸。
+        已确认领料单可在下方「近期领料记录」中<strong>作废并退纸</strong>：按原单实际扣纸页数
+        返还对应纸型，重复点击只返还一次；作废后的单号不能再次用于确认领料。</p>
 
       <div class="stock-grid">
         <fieldset>
@@ -192,7 +194,8 @@
         <table class="stock-table">
           <thead><tr>
             <th>领料单号</th><th>纸型 (mm)</th><th>用纸页数</th>
-            <th>标签排入</th><th>扣减前 → 扣减后（张）</th><th>确认时间</th>
+            <th>标签排入</th><th>扣减前 → 扣减后（张）</th><th>状态</th>
+            <th>确认 / 作废时间</th><th>操作</th>
           </tr></thead>
           <tbody id="requisition-rows"></tbody>
         </table>

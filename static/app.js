@@ -704,21 +704,42 @@ async function refreshRequisitions() {
     const items = await resp.json();
     if (!items.length) {
       tbody.innerHTML =
-        `<tr class="empty-row"><td colspan="6">尚无领料记录：确认领料后这里会显示最近 10 条。</td></tr>`;
+        `<tr class="empty-row"><td colspan="8">尚无领料记录：确认领料后这里会显示最近 10 条。</td></tr>`;
       return;
     }
-    tbody.innerHTML = items.map((r) => `
-      <tr>
-        <td>${escapeHtml(r.order_no)}${r.reused ? '<span class="reused-tag">重试返回原记录</span>' : ""}</td>
+    tbody.innerHTML = items.map((r) => {
+      const voided = r.status === "voided";
+      const reusedTag = r.reused ? '<span class="reused-tag">重试返回原记录</span>' : "";
+      const timeCell = voided
+        ? `<div class="time-line">确认 ${escapeHtml(fmtDateTime(r.created_at))}</div>` +
+          `<div class="time-line void-time">作废 ${escapeHtml(fmtDateTime(r.voided_at))}</div>`
+        : fmtDateTime(r.created_at);
+      const stockCell = voided
+        ? `${r.stock_before} → ${r.stock_after}` +
+          `<div class="return-line">退纸 +${r.returned_pages}` +
+          (Number.isFinite(r.restock_after) ? ` → ${r.restock_after}` : "") +
+          `</div>`
+        : `${r.stock_before} → ${r.stock_after}`;
+      const action = voided
+        ? '<span class="voided-note">已作废 · 纸已返还</span>'
+        : `<button type="button" class="void-btn" data-order="${escapeAttr(r.order_no)}">作废并退纸</button>`;
+      return `
+      <tr class="${voided ? "voided-row" : ""}">
+        <td>${escapeHtml(r.order_no)}${reusedTag}</td>
         <td>${r.paper_width} × ${r.paper_height}</td>
         <td>${r.pages_required}</td>
         <td>${r.labels_placed} / ${r.labels_requested}</td>
-        <td>${r.stock_before} → ${r.stock_after}</td>
-        <td>${fmtDateTime(r.created_at)}</td>
-      </tr>`).join("");
+        <td>${stockCell}</td>
+        <td>${voided
+          ? '<span class="status-badge status-voided">已作废</span>'
+          : '<span class="status-badge status-confirmed">已确认</span>'}</td>
+        <td>${timeCell}</td>
+        <td>${action}</td>
+      </tr>`;
+    }).join("");
   } catch (err) {
     tbody.innerHTML =
-      `<tr class="empty-row"><td colspan="6">领料记录加载失败：${escapeHtml(err.message)}</td></tr>`;
+      `<tr class="empty-row"><td colspan="8">领料记录加载失败：${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
@@ -820,6 +841,66 @@ $("stock-use-page").addEventListener("click", () => {
 });
 $("stock-register").addEventListener("click", registerStock);
 $("requisition-confirm").addEventListener("click", confirmRequisition);
+
+async function voidRequisition(orderNo, btn) {
+  // 防重复点击：请求未返回前禁用按钮（并发请求服务端也只返还一次）
+  btn.disabled = true;
+  let resp;
+  try {
+    resp = await fetch("/api/requisitions/void", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ order_no: orderNo }),
+    });
+  } catch (err) {
+    btn.disabled = false;
+    showRequisitionResult("err", `<strong>作废请求失败：</strong>${escapeHtml(err.message)}`);
+    return;
+  }
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    btn.disabled = false;
+    showRequisitionResult(
+      "err",
+      `<strong>领料单未作废（${resp.status === 404 ? "单号不存在" : "冲突"}）：</strong>` +
+      `${escapeHtml(data.detail || "未知错误")}`
+    );
+    return;
+  }
+  if (data.already_voided) {
+    showRequisitionResult(
+      "reuse",
+      `领料单 <strong>${escapeHtml(data.order_no)}</strong> 此前已作废，` +
+      `本次未重复返还纸张（共退 <strong>${data.returned_pages}</strong> 张，` +
+      `作废时间 ${fmtDateTime(data.voided_at)}）。`
+    );
+  } else {
+    showRequisitionResult(
+      "ok",
+      `<div><span class="reused-tag" style="background:#fee2e2;color:#991b1b">领料单已作废 · 已退纸</span></div>` +
+      `领料单 <strong>${escapeHtml(data.order_no)}</strong> 已作废：按原单实际用纸 ` +
+      `<strong class="big">${data.returned_pages}</strong> 张 ` +
+      `<strong>${data.paper_width}×${data.paper_height}mm</strong> 返还库存，` +
+      `余量 ${data.restock_before} → <strong class="big">${data.restock_after}</strong> 张。<br/>` +
+      `<span class="muted">该单号不能再次用于确认领料；作废时间：${fmtDateTime(data.voided_at)}</span>`
+    );
+  }
+  // 成功后刷新库存余量与领料记录（按钮随整表重建，无需手动恢复）
+  await Promise.all([refreshStock(), refreshRequisitions()]);
+}
+
+// 作废按钮随表格重建，用事件委托绑定到固定的表体
+$("requisition-rows").addEventListener("click", (e) => {
+  const btn = e.target.closest ? e.target.closest(".void-btn") : null;
+  if (!btn) return;
+  const orderNo = btn.dataset.order;
+  if (!confirm(
+    `确认作废领料单 ${orderNo} 并退纸？\n\n` +
+    "将按原单实际扣纸页数把对应纸型返还库存；作废后该单号不能再次用于确认领料，" +
+    "且操作不可撤销。"
+  )) return;
+  voidRequisition(orderNo, btn);
+});
 
 refreshStock();
 refreshRequisitions();

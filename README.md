@@ -36,6 +36,9 @@
 在单个 SQLite 事务内完成库存核对、余量扣减与领料记录写入。同一领料
 单号 + 同一参数重试只返回原记录、**不重复扣纸**；单号相同但参数变化
 返回冲突（HTTP 409）；库存不足时错误信息同时给出所需页数与当前余量。
+已确认领料单可**作废并退纸**：按原单实际扣纸页数把对应纸型返还库存，
+原单保留作废时间与返还张数；回补与状态变更在同一 SQLite 事务中完成，
+重复点击或并发请求**只返还一次**；作废后的单号不能再次用于确认领料。
 库存与领料记录通过 Docker Compose 命名卷持久化。
 
 技术栈：Python 3.11 + FastAPI + SQLite（标准库，零额外依赖）+ 原生
@@ -197,7 +200,25 @@ docker compose up --build
     还差 2 张；请补登记库存后重试。`
   - 页面下方展示本次确认结果（用纸页数、排入数、扣减前后余量）与
     **近期领料记录**（最近 10 条：单号、纸型、页数、排入、余量变化、
-    时间）；数据保存在 SQLite 并通过 Compose 命名卷持久化。
+    **状态**、确认 / 作废时间、操作）；数据保存在 SQLite 并通过 Compose
+    命名卷持久化。
+  - **作废并退纸（操作入口：近期领料记录表「操作」列的「作废并退纸」
+    按钮，仅未作废单显示）**：
+    1. 点击后二次确认，作废在单个 `BEGIN IMMEDIATE` 事务内完成——
+       按**原单实际扣纸页数**（`pages_required`）把对应纸型张数加回
+       库存，同时把单据状态置为「已作废」、写入作废时间与返还张数，
+       库存回补与状态变更要么全部生效要么全部回滚；
+    2. 原单**不删除**：单号、纸型、用纸页数、原扣减前后余量快照与
+       确认时间全部保留，新增作废时间、返还张数与回补前后余量；
+    3. **只返还一次**：作废使用条件更新
+       `WHERE status='confirmed'`，重复点击按钮或多个并发请求同时作废
+       同一单号时，只有第一个请求真正退纸，其余直接返回原作废记录
+       （`already_voided=true`，HTTP 200），库存不会被重复加回；
+    4. 作废成功后界面自动刷新**库存余量**与领料记录，状态列显示
+       「已作废」，作废行显示返还张数、返还后余量与作废时间；
+    5. **作废后的单号永久失效**：再用该单号确认领料（无论参数是否与
+       原单相同）一律 HTTP 409 拒绝并提示已作废信息，请使用新单号；
+    6. 作废不存在的单号返回 HTTP 404 及明确中文提示。
 
 ## 接口
 
@@ -212,8 +233,9 @@ docker compose up --build
 | POST | `/api/calibration/solve` | 提交两组「设计 / 实测」刻线坐标，返回 X / Y 拟合结果 `scale`、`offset` |
 | GET  | `/api/stock` | 查看全部纸型当前余量（纸宽、纸高、张数、最近入库时间） |
 | POST | `/api/stock` | 按 `paper_width` / `paper_height` / `quantity` 登记入库；同纸型累加余量，返回该纸型最新余量 |
-| POST | `/api/requisitions` | 确认领料：`{order_no, params}`，服务端用 params 重算拼版，全部排入且纸型匹配、余量充足时在 SQLite 事务内按实际页数扣纸并写记录；成功 HTTP 201，同单号同参数重试返回 HTTP 200 + 原记录（`reused=true`）不重复扣纸，同单号参数变化 / 纸型未登记 / 余量不足返回 HTTP 409，有标签未排入或拼版参数非法返回 HTTP 400 |
-| GET  | `/api/requisitions?limit=10` | 近期领料记录（最新在前，默认 10 条，最多 100 条） |
+| POST | `/api/requisitions` | 确认领料：`{order_no, params}`，服务端用 params 重算拼版，全部排入且纸型匹配、余量充足时在 SQLite 事务内按实际页数扣纸并写记录；成功 HTTP 201，同单号同参数重试返回 HTTP 200 + 原记录（`reused=true`）不重复扣纸，同单号参数变化 / **单号已作废** / 纸型未登记 / 余量不足返回 HTTP 409，有标签未排入或拼版参数非法返回 HTTP 400 |
+| POST | `/api/requisitions/void` | 作废领料单并退纸：`{order_no}`，在 SQLite 事务内按原单 `pages_required` 返还对应纸型并把状态置为 `voided`（写入 `voided_at`、`returned_pages` 与回补前后余量）；HTTP 200，重复 / 并发作废同一单号只返还一次（其后响应 `already_voided=true`），单号不存在返回 HTTP 404 |
+| GET  | `/api/requisitions?limit=10` | 近期领料记录（最新在前，默认 10 条，最多 100 条；含 `status`（`confirmed`/`voided`）、`voided_at`、`returned_pages`、`restock_before/after`） |
 
 `/api/svg` 在服务端重新计算同一份排版，保证导出坐标与预览一致。
 其 `show_occupied` 开关仅预览时为 `true`（第一页灰色绘制占用区）；
@@ -385,6 +407,51 @@ curl -X POST http://localhost:8000/api/requisitions \
   **所需页数、当前余量（未登记为 0 张）与差额**；
 - 有标签未全部排入：HTTP 400（拼版结果仍可在页面正常预览）。
 
+作废领料单并退纸（按原单实际扣纸页数返还；重复 / 并发调用只返还一次）：
+
+```bash
+curl -X POST http://localhost:8000/api/requisitions/void \
+  -H 'Content-Type: application/json' \
+  -d '{"order_no": "LL-20260925-001"}'
+```
+
+返回 HTTP 200：
+
+```json
+{
+  "reused": false,
+  "order_no": "LL-20260925-001",
+  "paper_width": 210.0,
+  "paper_height": 297.0,
+  "pages_required": 2,
+  "labels_requested": 20,
+  "labels_placed": 20,
+  "stock_before": 100,
+  "stock_after": 98,
+  "created_at": "2026-09-25T14:03:07",
+  "status": "voided",
+  "voided_at": "2026-09-25T15:10:42",
+  "returned_pages": 2,
+  "restock_before": 98,
+  "restock_after": 100,
+  "already_voided": false
+}
+```
+
+- 原单原有的扣纸快照（`stock_before`/`stock_after`）与确认时间保留；
+  `returned_pages` 恒等于原单实际扣纸页数 `pages_required`；
+- 再次调用同一单号作废：HTTP 200 且 `already_voided=true`、
+  `voided_at/returned_pages` 与首次作废一致，余量不重复增加；
+- 单号不存在：HTTP 404，`detail` 提示单号不存在；
+- 作废成功后再用该单号确认领料：HTTP 409，提示该单号已作废、
+  不能再次用于确认领料。
+
+> **旧版本数据库兼容**：升级后首次启动会自动对旧 `requisitions` 表
+> 逐列 `ALTER TABLE` 补出 `status` / `voided_at` / `returned_pages` /
+> `restock_before` / `restock_after` 列，已有领料记录自动视为
+> `confirmed`（未作废、未返还），历史数据与 Docker Compose 数据卷
+> 无需任何手工迁移。
+
 数据库文件默认为项目根目录 `data/label_stock.db`，可用环境变量
 `LABEL_STOCK_DB` 指定其它路径；本地开发时容器外运行会自动创建该目录。
 
@@ -409,8 +476,8 @@ SQLite 数据库默认写入项目根目录 `data/label_stock.db`（自动创建
 │   ├── layout.py      # 天际线拼版算法
 │   ├── calibration.py # 走纸误差拟合、校准校验、测试页刻线坐标
 │   ├── svg.py         # SVG 生成（预览/导出/校准测试页）
-│   ├── db.py          # SQLite 连接、建表与会话依赖
-│   ├── stock.py       # 库存登记与领料事务（重算拼版、核对、扣减、幂等）
+│   ├── db.py          # SQLite 连接、建表、旧库迁移与会话依赖
+│   ├── stock.py       # 库存登记、领料事务与作废退纸（重算拼版、核对、扣减、幂等、回补）
 │   └── bootstrap.py   # 启动初始化自检
 ├── static/
 │   ├── index.html     # 单页界面（含纸张库存与领料面板）

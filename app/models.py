@@ -244,7 +244,7 @@ class RequisitionConfirmRequest(BaseModel):
 
 
 class RequisitionResult(BaseModel):
-    """领料确认结果（同时也是近期领料记录中每条记录的形状）。"""
+    """领料确认 / 作废结果（同时也是近期领料记录中每条记录的形状）。"""
 
     reused: bool = Field(
         False,
@@ -259,3 +259,36 @@ class RequisitionResult(BaseModel):
     stock_before: int = Field(..., description="扣减前该纸型余量（张）")
     stock_after: int = Field(..., description="扣减后该纸型余量（张）")
     created_at: str
+    status: str = Field(
+        "confirmed",
+        description="单据状态：confirmed=已确认（有效领料），voided=已作废（纸已返还）",
+    )
+    voided_at: str | None = Field(None, description="作废时间；未作废时为 null")
+    returned_pages: int = Field(
+        0, description="作废时按原单实际扣纸页数返还到库存的张数；未作废为 0"
+    )
+    restock_before: int | None = Field(
+        None, description="作废返还前该纸型余量（张）；未作废为 null"
+    )
+    restock_after: int | None = Field(
+        None, description="作废返还后该纸型余量（张）；未作废为 null"
+    )
+    already_voided: bool = Field(
+        False,
+        description="true 表示作废请求命中已作废单，本次未重复返还纸张",
+    )
+
+
+class RequisitionVoidRequest(BaseModel):
+    """领料单作废请求：按领料单号作废并退纸。
+
+    作废时按原单**实际扣纸页数**（pages_required）把对应纸型张数返还
+    库存，并在原记录上写入作废时间与返还张数；库存回补与状态变更在同一
+    个 SQLite 事务内完成。重复点击 / 并发请求只有第一次真正返还，
+    之后只返回原作废记录（already_voided=true，HTTP 200）。作废后的单号
+    不能再次用于确认领料。
+    """
+
+    order_no: str = Field(
+        ..., min_length=1, max_length=40, description="需要作废的领料单号"
+    )
