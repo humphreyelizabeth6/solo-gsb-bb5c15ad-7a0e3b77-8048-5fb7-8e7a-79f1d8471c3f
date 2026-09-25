@@ -234,7 +234,8 @@ class RequisitionConfirmRequest(BaseModel):
     服务端收到后用 params **重新计算拼版**，仅在所有标签全部排入、
     且纸张宽高与库存纸型完全一致时，按实际页数扣减余量，并写入领料
     记录。同一 order_no 重试时：参数指纹一致则返回原记录不重复扣纸；
-    参数变化返回 HTTP 409 冲突。
+    参数变化返回 HTTP 409 冲突。已作废的单号不能再次用于确认领料
+    （同样返回 HTTP 409），请改用新的领料单号。
     """
 
     order_no: str = Field(
@@ -259,3 +260,37 @@ class RequisitionResult(BaseModel):
     stock_before: int = Field(..., description="扣减前该纸型余量（张）")
     stock_after: int = Field(..., description="扣减后该纸型余量（张）")
     created_at: str
+    status: str = Field(
+        "confirmed", description="领料单状态：confirmed=有效，voided=已作废"
+    )
+    voided_at: str | None = Field(None, description="作废时间；未作废为 null")
+    returned_pages: int | None = Field(
+        None, description="作废时按原单页数返还的张数；未作废为 null"
+    )
+
+
+class RequisitionVoidResult(BaseModel):
+    """领料单作废结果。
+
+    作废把原单实际扣纸页数（pages_required）返还到对应纸型余量，
+    并在原单上记录作废时间与返还张数；重复作废幂等返回原作废信息，
+    不重复回补库存。
+    """
+
+    already_voided: bool = Field(
+        False,
+        description="true 表示该单此前已作废，本次幂等返回、未重复回补库存",
+    )
+    order_no: str
+    status: str = Field("voided", description="作废后状态，恒为 voided")
+    paper_width: float
+    paper_height: float
+    pages_required: int = Field(..., description="原单实际扣纸页数")
+    returned_pages: int = Field(..., description="作废返还张数（= 原单页数）")
+    voided_at: str = Field(..., description="作废时间")
+    stock_before: int = Field(
+        ..., description="回补前该纸型余量（张）；已作废重复调用时为当前余量"
+    )
+    stock_after: int = Field(
+        ..., description="回补后该纸型余量（张）；已作废重复调用时为当前余量"
+    )

@@ -532,11 +532,13 @@ def main() -> int:
     # ---- 纸张库存与领料：登记、事务扣纸、幂等重试、冲突与库存不足 ----
     from .db import connect as db_connect, create_schema
     from .stock import (
+        RequisitionNotFound,
         StockConflict,
         confirm_requisition,
         list_requisitions,
         list_stock,
         register_stock,
+        void_requisition,
     )
 
     test_conn = db_connect(":memory:")
@@ -650,7 +652,135 @@ def main() -> int:
     fuzzy = register_stock(test_conn, 40.004, 40.0, 1)
     assert fuzzy.paper_width == 40.0 and fuzzy.quantity == 1
 
+    # ---- 领料单作废与退纸：回补库存、幂等、作废单号封禁 ----
+    # 当前 40×40 余量 1 张（LL-005 扣到 0 后 fuzzy 入 1 张）；补到 10 张再开新单
+    register_stock(test_conn, 40, 40, 9)
+    res3 = confirm_requisition(test_conn, "LL-006", req_stock)
+    assert res3["stock_before"] == 10 and res3["stock_after"] == 7
+    assert res3["status"] == "confirmed"
+    assert res3["voided_at"] is None and res3["returned_pages"] is None
+
+    # 作废：按原单实际页数 3 张回补，余量 7 → 10，记录作废时间与返还张数
+    v = void_requisition(test_conn, "LL-006")
+    assert v["already_voided"] is False
+    assert v["status"] == "voided" and v["voided_at"]
+    assert v["returned_pages"] == 3 and v["pages_required"] == 3
+    assert v["stock_before"] == 7 and v["stock_after"] == 10
+    assert list_stock(test_conn)[0].quantity == 10
+
+    # 重复作废（双击 / 重试）：幂等返回原作废信息，库存只回补一次
+    v2 = void_requisition(test_conn, "LL-006")
+    assert v2["already_voided"] is True
+    assert v2["returned_pages"] == 3 and v2["voided_at"] == v["voided_at"]
+    assert list_stock(test_conn)[0].quantity == 10
+
+    # 近期记录带状态：LL-006 已作废（含作废时间与返还张数），LL-005 仍有效
+    recs = {r["order_no"]: r for r in list_requisitions(test_conn)}
+    assert recs["LL-006"]["status"] == "voided"
+    assert recs["LL-006"]["returned_pages"] == 3 and recs["LL-006"]["voided_at"]
+    assert recs["LL-005"]["status"] == "confirmed"
+    assert recs["LL-005"]["voided_at"] is None
+    assert recs["LL-005"]["returned_pages"] is None
+
+    # 作废后的单号不能再次确认领料：同参数、改参数都报冲突，余量不变
+    for params_again in (req_stock, req_changed):
+        try:
+            confirm_requisition(test_conn, "LL-006", params_again)
+        except StockConflict as exc:
+            assert "作废" in str(exc), str(exc)
+        else:
+            raise AssertionError("作废单号应被拒绝再次确认领料")
+    assert list_stock(test_conn)[0].quantity == 10
+
+    # 作废不存在的单号：RequisitionNotFound（路由层映射 HTTP 404）
+    try:
+        void_requisition(test_conn, "LL-404")
+    except RequisitionNotFound as exc:
+        assert "不存在" in str(exc), str(exc)
+    else:
+        raise AssertionError("不存在的单号应报 RequisitionNotFound")
+    assert list_stock(test_conn)[0].quantity == 10
+
     test_conn.close()
+
+    # 旧版库迁移：没有作废列的 requisitions 表经 create_schema 自动补列，
+    # 已有记录默认 status='confirmed'，可正常作废；迁移本身幂等
+    legacy = db_connect(":memory:")
+    legacy.executescript("""
+    CREATE TABLE paper_stock (
+        paper_width  REAL    NOT NULL,
+        paper_height REAL    NOT NULL,
+        quantity     INTEGER NOT NULL CHECK (quantity >= 0),
+        updated_at   TEXT,
+        PRIMARY KEY (paper_width, paper_height)
+    );
+    CREATE TABLE requisitions (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_no         TEXT    NOT NULL UNIQUE,
+        paper_width      REAL    NOT NULL,
+        paper_height     REAL    NOT NULL,
+        pages_required   INTEGER NOT NULL,
+        labels_requested INTEGER NOT NULL,
+        labels_placed    INTEGER NOT NULL,
+        stock_before     INTEGER NOT NULL,
+        stock_after      INTEGER NOT NULL,
+        params_json      TEXT    NOT NULL,
+        params_hash      TEXT    NOT NULL,
+        created_at       TEXT    NOT NULL
+    );
+    """)
+    legacy.execute(
+        "INSERT INTO requisitions (order_no, paper_width, paper_height, "
+        "pages_required, labels_requested, labels_placed, stock_before, "
+        "stock_after, params_json, params_hash, created_at) VALUES "
+        "('LL-OLD', 40.0, 40.0, 2, 5, 5, 8, 6, '{}', 'oldhash', "
+        "'2026-09-25T10:00:00')"
+    )
+    register_stock(legacy, 40, 40, 4)  # 旧库已有库存 4 张
+    create_schema(legacy)  # 迁移：补 status / voided_at / returned_pages 列
+    (old_rec,) = [r for r in list_requisitions(legacy) if r["order_no"] == "LL-OLD"]
+    assert old_rec["status"] == "confirmed"
+    assert old_rec["voided_at"] is None and old_rec["returned_pages"] is None
+    # 旧记录可正常作废：按原单 2 页回补，余量 4 → 6
+    v_old = void_requisition(legacy, "LL-OLD")
+    assert v_old["returned_pages"] == 2
+    assert v_old["stock_before"] == 4 and v_old["stock_after"] == 6
+    create_schema(legacy)  # 再次迁移仍然幂等（列已存在，不重复 ALTER）
+    legacy.close()
+
+    # 并发作废：多个连接同时作废同一单，库存只回补一次
+    import tempfile
+    import threading
+    from pathlib import Path
+
+    from .db import init_db as _init_db
+
+    race_db = Path(tempfile.mkdtemp()) / "void_race.db"
+    _init_db(race_db)
+    setup = db_connect(race_db)
+    register_stock(setup, 40, 40, 5)
+    confirm_requisition(setup, "LL-RACE", req_stock)  # 扣 3 张，余量 5 → 2
+    setup.close()
+
+    race_results = []
+
+    def _void_once() -> None:
+        c = db_connect(race_db)
+        try:
+            race_results.append(void_requisition(c, "LL-RACE"))
+        finally:
+            c.close()
+
+    threads = [threading.Thread(target=_void_once) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sum(1 for r in race_results if not r["already_voided"]) == 1
+    assert sum(1 for r in race_results if r["already_voided"]) == 3
+    check = db_connect(race_db)
+    assert list_stock(check)[0].quantity == 5  # 2 + 3，只回补一次
+    check.close()
 
 
     print(f"[bootstrap] 自检通过（FastAPI {fastapi.__version__}, "

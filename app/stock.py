@@ -1,4 +1,4 @@
-"""纸张库存登记与领料确认（全部写操作在单个 SQLite 事务内完成）。
+"""纸张库存登记与领料确认 / 作废（全部写操作在单个 SQLite 事务内完成）。
 
 业务规则：
 
@@ -8,7 +8,11 @@
 - 库存核对、余量扣减、领料记录写入在同一事务（BEGIN IMMEDIATE）中完成，
   并发确认不会超扣；
 - 同一领料单号重试：参数指纹一致则直接返回原记录，**不重复扣纸**；
-  单号相同但参数变化时抛 :class:`StockConflict`（HTTP 409）。
+  单号相同但参数变化时抛 :class:`StockConflict`（HTTP 409）；
+- 已确认的领料单可**作废退纸**：按原单实际扣纸页数把对应纸型余量回补，
+  并在原单记录作废时间与返还张数；回补与状态变更在同一事务中提交，
+  重复作废 / 并发作废只回补一次（幂等返回原作废信息）；
+- 作废后的单号不能再次用于确认领料（无论参数是否变化，均 HTTP 409）。
 """
 
 from __future__ import annotations
@@ -23,8 +27,12 @@ from .models import LayoutRequest, StockItem
 
 
 class StockConflict(Exception):
-    """业务冲突：同单号参数变化、纸型无库存 / 尺寸不匹配、库存不足或
-    标签未全部排入。路由层按 409（参数冲突）/ 400 区分映射。"""
+    """业务冲突：同单号参数变化、单号已作废、纸型无库存 / 尺寸不匹配、
+    库存不足或标签未全部排入。路由层按 409（参数冲突）/ 400 区分映射。"""
+
+
+class RequisitionNotFound(Exception):
+    """领料单号不存在（路由层映射 HTTP 404）。"""
 
 
 def _norm_dim(v: float) -> float:
@@ -102,18 +110,32 @@ def _row_to_result(row: sqlite3.Row, reused: bool) -> dict:
         "stock_before": row["stock_before"],
         "stock_after": row["stock_after"],
         "created_at": row["created_at"],
+        "status": row["status"],
+        "voided_at": row["voided_at"],
+        "returned_pages": row["returned_pages"],
     }
 
 
 def list_requisitions(conn: sqlite3.Connection, limit: int = 10) -> list[dict]:
-    """近期领料记录（最新在前）。"""
+    """近期领料记录（最新在前），含作废状态、作废时间与返还张数。"""
     rows = conn.execute(
         "SELECT order_no, paper_width, paper_height, pages_required, "
-        "labels_requested, labels_placed, stock_before, stock_after, created_at "
+        "labels_requested, labels_placed, stock_before, stock_after, "
+        "created_at, status, voided_at, returned_pages "
         "FROM requisitions ORDER BY id DESC LIMIT ?",
         (max(1, min(limit, 100)),),
     ).fetchall()
     return [_row_to_result(r, reused=False) for r in rows]
+
+
+def _voided_conflict(order_no: str, row: sqlite3.Row) -> StockConflict:
+    """作废单号再次用于确认领料时的冲突（无论参数是否一致）。"""
+    return StockConflict(
+        f"领料单号「{order_no}」已于 {row['voided_at']} 作废"
+        f"（原单 {row['pages_required']} 张已返还 "
+        f"{row['paper_width']:g}×{row['paper_height']:g}mm 库存），"
+        "作废后的单号不能再次用于确认领料：请改用新的领料单号。"
+    )
 
 
 def confirm_requisition(
@@ -134,6 +156,9 @@ def confirm_requisition(
         "SELECT * FROM requisitions WHERE order_no = ?", (order_no,)
     ).fetchone()
     if existing is not None:
+        # 作废单号永久封禁：即使参数完全一致也不能再次确认领料
+        if existing["status"] == "voided":
+            raise _voided_conflict(order_no, existing)
         if existing["params_hash"] == params_hash:
             return _row_to_result(existing, reused=True)
         raise StockConflict(
@@ -169,6 +194,8 @@ def confirm_requisition(
             "SELECT * FROM requisitions WHERE order_no = ?", (order_no,)
         ).fetchone()
         if dup is not None:
+            if dup["status"] == "voided":
+                raise _voided_conflict(order_no, dup)
             if dup["params_hash"] == params_hash:
                 conn.execute("ROLLBACK")
                 return _row_to_result(dup, reused=True)
@@ -225,6 +252,8 @@ def confirm_requisition(
             winner = conn.execute(
                 "SELECT * FROM requisitions WHERE order_no = ?", (order_no,)
             ).fetchone()
+            if winner is not None and winner["status"] == "voided":
+                raise _voided_conflict(order_no, winner) from exc
             if winner is not None and winner["params_hash"] == params_hash:
                 conn.execute("ROLLBACK")
                 return _row_to_result(winner, reused=True)
@@ -245,3 +274,93 @@ def confirm_requisition(
         "SELECT * FROM requisitions WHERE order_no = ?", (order_no,)
     ).fetchone()
     return _row_to_result(saved, reused=False)
+
+
+def _void_result(
+    row: sqlite3.Row, already_voided: bool, stock_before: int, stock_after: int
+) -> dict:
+    return {
+        "already_voided": already_voided,
+        "order_no": row["order_no"],
+        "status": "voided",
+        "paper_width": row["paper_width"],
+        "paper_height": row["paper_height"],
+        "pages_required": row["pages_required"],
+        "returned_pages": row["returned_pages"],
+        "voided_at": row["voided_at"],
+        "stock_before": stock_before,
+        "stock_after": stock_after,
+    }
+
+
+def void_requisition(conn: sqlite3.Connection, order_no: str) -> dict:
+    """作废已确认的领料单：按原单实际扣纸页数回补对应纸型余量。
+
+    库存回补与状态变更（status→voided、记录作废时间与返还张数）在同一
+    BEGIN IMMEDIATE 事务中原子提交；重复点击或并发请求在写锁上排队，
+    后到者读到已作废状态后幂等返回（already_voided=True），**库存只
+    回补一次**。单号不存在抛 :class:`RequisitionNotFound`（HTTP 404）。
+    """
+    order_no = order_no.strip()
+    if not order_no:
+        raise RequisitionNotFound("领料单号不能为空。")
+    now = _now()
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT * FROM requisitions WHERE order_no = ?", (order_no,)
+        ).fetchone()
+        if row is None:
+            raise RequisitionNotFound(
+                f"领料单号「{order_no}」不存在：请核对单号后重试。"
+            )
+        if row["status"] == "voided":
+            # 幂等：该单此前已作废并回补过，本次只读当前余量、不再回补
+            conn.execute("ROLLBACK")
+            cur = conn.execute(
+                "SELECT quantity FROM paper_stock "
+                "WHERE paper_width = ? AND paper_height = ?",
+                (row["paper_width"], row["paper_height"]),
+            ).fetchone()
+            current = cur["quantity"] if cur is not None else 0
+            return _void_result(row, True, current, current)
+
+        pages = row["pages_required"]
+        w, h = row["paper_width"], row["paper_height"]
+        # 回补库存：纸型行在确认领料时已存在（库存只增不减、无删除入口），
+        # 这里仍用 upsert 兜底，保证回补不丢
+        conn.execute(
+            """
+            INSERT INTO paper_stock (paper_width, paper_height, quantity, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(paper_width, paper_height) DO UPDATE SET
+                quantity = quantity + excluded.quantity,
+                updated_at = excluded.updated_at
+            """,
+            (w, h, pages, now),
+        )
+        stock_after = conn.execute(
+            "SELECT quantity FROM paper_stock "
+            "WHERE paper_width = ? AND paper_height = ?",
+            (w, h),
+        ).fetchone()["quantity"]
+        stock_before = stock_after - pages
+        conn.execute(
+            "UPDATE requisitions SET status = 'voided', voided_at = ?, "
+            "returned_pages = ? WHERE order_no = ?",
+            (now, pages, order_no),
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        # 未提交（包括单号不存在与任何异常）一律回滚，库存保持原样
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+
+    saved = conn.execute(
+        "SELECT * FROM requisitions WHERE order_no = ?", (order_no,)
+    ).fetchone()
+    return _void_result(saved, False, stock_before, stock_after)

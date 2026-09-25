@@ -36,6 +36,12 @@
 在单个 SQLite 事务内完成库存核对、余量扣减与领料记录写入。同一领料
 单号 + 同一参数重试只返回原记录、**不重复扣纸**；单号相同但参数变化
 返回冲突（HTTP 409）；库存不足时错误信息同时给出所需页数与当前余量。
+
+支持**领料单作废与退纸**：对已确认的领料单一键作废，按原单实际扣纸
+页数把对应纸型余量回补入库，原单保留作废时间与返还张数；库存回补与
+状态变更在同一 SQLite 事务中提交，重复点击或并发请求**只返还一次**
+（幂等返回原作废信息）；作废后的单号不能再次用于确认领料。近期领料
+记录逐条显示「有效 / 已作废」状态，作废成功后库存余量即时刷新。
 库存与领料记录通过 Docker Compose 命名卷持久化。
 
 技术栈：Python 3.11 + FastAPI + SQLite（标准库，零额外依赖）+ 原生
@@ -65,7 +71,7 @@ docker compose up --build
 `docker compose down -v`（会同时删除数据卷）。
 
 > 容器启动时会自动执行：安装依赖 → 初始化自检（排版、SVG 生成、
-> 打印校准与库存领料事务的冒烟测试）→ 启动 uvicorn。
+> 打印校准与库存领料 / 作废退纸事务的冒烟测试）→ 启动 uvicorn。
 
 ## 功能说明
 
@@ -191,13 +197,22 @@ docker compose up --build
   - **重试幂等**：同一领料单号 + 相同参数再次提交，返回原领料记录
     （响应中 `reused=true`，HTTP 200），**不重新计算扣纸**、余量不变；
     单号相同但参数变化返回 **HTTP 409 冲突**，明确提示原记录内容；
+  - **作废退纸**：「近期领料记录」中每条「有效」单都有「作废退纸」
+    按钮，点击并确认后按**原单实际扣纸页数**把对应纸型余量回补入库，
+    原单保留作废时间与返还张数（状态变为「已作废」）；库存回补与
+    状态变更在同一 `BEGIN IMMEDIATE` 事务中提交，**重复点击或并发
+    请求只返还一次**（重复作废幂等返回原作废信息，
+    `already_voided=true`，余量不再变动）；作废后的单号不能再次
+    用于确认领料（同参数、改参数均返回 HTTP 409）；作废成功后
+    页面自动刷新库存余量与记录状态；
   - **库存不足提示**：错误信息同时给出本次实际所需页数、当前余量与
     差额（或纸型未登记时提示余量 0 张），例如：
     `纸型 210×297mm 库存不足：本次拼版实际需要 6 张，当前余量仅 4 张，
     还差 2 张；请补登记库存后重试。`
-  - 页面下方展示本次确认结果（用纸页数、排入数、扣减前后余量）与
-    **近期领料记录**（最近 10 条：单号、纸型、页数、排入、余量变化、
-    时间）；数据保存在 SQLite 并通过 Compose 命名卷持久化。
+  - 页面下方展示本次确认 / 作废结果（用纸页数、排入数、扣减或回补
+    前后余量）与**近期领料记录**（最近 10 条：单号、纸型、页数、
+    排入、余量变化、状态、时间、作废操作）；数据保存在 SQLite 并
+    通过 Compose 命名卷持久化。
 
 ## 接口
 
@@ -212,8 +227,9 @@ docker compose up --build
 | POST | `/api/calibration/solve` | 提交两组「设计 / 实测」刻线坐标，返回 X / Y 拟合结果 `scale`、`offset` |
 | GET  | `/api/stock` | 查看全部纸型当前余量（纸宽、纸高、张数、最近入库时间） |
 | POST | `/api/stock` | 按 `paper_width` / `paper_height` / `quantity` 登记入库；同纸型累加余量，返回该纸型最新余量 |
-| POST | `/api/requisitions` | 确认领料：`{order_no, params}`，服务端用 params 重算拼版，全部排入且纸型匹配、余量充足时在 SQLite 事务内按实际页数扣纸并写记录；成功 HTTP 201，同单号同参数重试返回 HTTP 200 + 原记录（`reused=true`）不重复扣纸，同单号参数变化 / 纸型未登记 / 余量不足返回 HTTP 409，有标签未排入或拼版参数非法返回 HTTP 400 |
-| GET  | `/api/requisitions?limit=10` | 近期领料记录（最新在前，默认 10 条，最多 100 条） |
+| POST | `/api/requisitions` | 确认领料：`{order_no, params}`，服务端用 params 重算拼版，全部排入且纸型匹配、余量充足时在 SQLite 事务内按实际页数扣纸并写记录；成功 HTTP 201，同单号同参数重试返回 HTTP 200 + 原记录（`reused=true`）不重复扣纸，同单号参数变化 / 单号已作废 / 纸型未登记 / 余量不足返回 HTTP 409，有标签未排入或拼版参数非法返回 HTTP 400 |
+| GET  | `/api/requisitions?limit=10` | 近期领料记录（最新在前，默认 10 条，最多 100 条）；每条含 `status`（`confirmed`/`voided`）、`voided_at`（作废时间）、`returned_pages`（返还张数） |
+| POST | `/api/requisitions/{order_no}/void` | 作废领料单并退纸：按原单实际扣纸页数回补对应纸型余量，原单记录作废时间与返还张数（同一 SQLite 事务）；成功 HTTP 200，重复作废幂等返回 `already_voided=true` 不重复回补，单号不存在返回 HTTP 404 |
 
 `/api/svg` 在服务端重新计算同一份排版，保证导出坐标与预览一致。
 其 `show_occupied` 开关仅预览时为 `true`（第一页灰色绘制占用区）；
@@ -385,6 +401,38 @@ curl -X POST http://localhost:8000/api/requisitions \
   **所需页数、当前余量（未登记为 0 张）与差额**；
 - 有标签未全部排入：HTTP 400（拼版结果仍可在页面正常预览）。
 
+作废领料单（按原单实际页数退纸回补库存）：
+
+```bash
+curl -X POST http://localhost:8000/api/requisitions/LL-20260925-001/void
+```
+
+首次作废返回 HTTP 200，例如：
+
+```json
+{
+  "already_voided": false,
+  "order_no": "LL-20260925-001",
+  "status": "voided",
+  "paper_width": 210.0,
+  "paper_height": 297.0,
+  "pages_required": 2,
+  "returned_pages": 2,
+  "voided_at": "2026-09-25T15:20:41",
+  "stock_before": 98,
+  "stock_after": 100
+}
+```
+
+- 再次对同一单号作废：HTTP 200，`already_voided=true`，
+  `voided_at` 为首次作废时间，**库存不重复回补**；
+- 单号不存在：HTTP 404；
+- 作废后再用该单号确认领料（无论参数是否变化）：HTTP 409，
+  `detail` 提示该单已作废、请改用新单号；
+- `GET /api/requisitions` 的每条记录含 `status` / `voided_at` /
+  `returned_pages`：未作废单 `status=confirmed`、后两者为 `null`，
+  已作废单 `status=voided` 并带作废时间与返还张数。
+
 数据库文件默认为项目根目录 `data/label_stock.db`，可用环境变量
 `LABEL_STOCK_DB` 指定其它路径；本地开发时容器外运行会自动创建该目录。
 
@@ -392,7 +440,7 @@ curl -X POST http://localhost:8000/api/requisitions \
 
 ```bash
 pip install -r requirements.txt
-python -m app.bootstrap          # 可选：初始化自检（含库存领料事务冒烟测试）
+python -m app.bootstrap          # 可选：初始化自检（含库存领料 / 作废退纸事务冒烟测试）
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -410,7 +458,7 @@ SQLite 数据库默认写入项目根目录 `data/label_stock.db`（自动创建
 │   ├── calibration.py # 走纸误差拟合、校准校验、测试页刻线坐标
 │   ├── svg.py         # SVG 生成（预览/导出/校准测试页）
 │   ├── db.py          # SQLite 连接、建表与会话依赖
-│   ├── stock.py       # 库存登记与领料事务（重算拼版、核对、扣减、幂等）
+│   ├── stock.py       # 库存登记、领料确认与作废退纸事务（重算拼版、核对、扣减/回补、幂等）
 │   └── bootstrap.py   # 启动初始化自检
 ├── static/
 │   ├── index.html     # 单页界面（含纸张库存与领料面板）

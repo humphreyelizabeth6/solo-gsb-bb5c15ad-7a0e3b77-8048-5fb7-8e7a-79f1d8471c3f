@@ -42,9 +42,39 @@ CREATE TABLE IF NOT EXISTS requisitions (
     stock_after      INTEGER NOT NULL,
     params_json      TEXT    NOT NULL,
     params_hash      TEXT    NOT NULL,
+    status           TEXT    NOT NULL DEFAULT 'confirmed',
+    voided_at        TEXT,
+    returned_pages   INTEGER,
     created_at       TEXT    NOT NULL
 );
 """
+
+# 旧版数据库的 requisitions 表没有作废相关列，而 CREATE TABLE IF NOT EXISTS
+# 不会修改已有表；这里按列补齐（幂等）。SQLite 的 ALTER TABLE ... ADD COLUMN
+# 允许带常量默认值：已有记录读出时自动得到 status='confirmed'，
+# voided_at / returned_pages 为 NULL（未作废），与旧版语义完全一致。
+_REQUISITIONS_MIGRATIONS = (
+    (
+        "status",
+        "ALTER TABLE requisitions ADD COLUMN status "
+        "TEXT NOT NULL DEFAULT 'confirmed'",
+    ),
+    ("voided_at", "ALTER TABLE requisitions ADD COLUMN voided_at TEXT"),
+    (
+        "returned_pages",
+        "ALTER TABLE requisitions ADD COLUMN returned_pages INTEGER",
+    ),
+)
+
+
+def _migrate_requisitions(conn: sqlite3.Connection) -> None:
+    """给旧版 requisitions 表补齐作废相关列（幂等，可在每次连接时执行）。"""
+    existing = {
+        row["name"] for row in conn.execute("PRAGMA table_info(requisitions)")
+    }
+    for column, ddl in _REQUISITIONS_MIGRATIONS:
+        if column not in existing:
+            conn.execute(ddl)
 
 
 def db_path() -> Path:
@@ -73,14 +103,18 @@ def connect(database: str | Path | None = None) -> sqlite3.Connection:
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
-    """创建库存表与领料记录表（幂等）。
+    """创建库存表与领料记录表（幂等），并对旧版表做列级迁移。
 
     paper_stock 以（纸宽, 纸高）为业务主键，quantity 为当前余量；
     requisitions 以领料单号 order_no 为唯一键（幂等重试的核心），
     params_json 保存规范化后的请求参数，params_hash 为其指纹，
-    stock_before/after 记录扣减前后的余量快照。
+    stock_before/after 记录扣减前后的余量快照；
+    status（confirmed/voided）、voided_at、returned_pages 记录作废
+    状态、作废时间与返还张数——旧版表由 _migrate_requisitions 补齐，
+    已有记录默认 status='confirmed'，可直接作废。
     """
     conn.executescript(_SCHEMA)
+    _migrate_requisitions(conn)
 
 
 def init_db(database: str | Path | None = None) -> None:

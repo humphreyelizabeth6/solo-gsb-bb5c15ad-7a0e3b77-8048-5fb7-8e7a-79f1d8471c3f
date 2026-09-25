@@ -23,17 +23,20 @@ from .models import (
     LayoutResponse,
     RequisitionConfirmRequest,
     RequisitionResult,
+    RequisitionVoidResult,
     ReprintRequest,
     StockItem,
     StockRegisterRequest,
     SvgRequest,
 )
 from .stock import (
+    RequisitionNotFound,
     StockConflict,
     confirm_requisition,
     list_requisitions,
     list_stock,
     register_stock,
+    void_requisition,
 )
 from .svg import build_calibration_page, build_reprint_svg, build_svg, resolve_reprint_selection
 
@@ -197,6 +200,7 @@ def api_requisition_confirm(
 
     - 同单号 + 同参数重试：返回原记录（reused=true，HTTP 200），不重复扣纸；
     - 同单号但参数变化：HTTP 409 冲突，不扣纸；
+    - 单号已作废：HTTP 409，作废后的单号不能再次用于确认领料；
     - 标签未全部排入：HTTP 400；
     - 纸型未登记 / 尺寸不匹配 / 余量不足：HTTP 409，错误信息给出
       所需页数与当前余量。
@@ -231,8 +235,37 @@ def api_requisition_list(
     limit: int = Query(10, ge=1, le=100, description="返回最近多少条"),
     conn: sqlite3.Connection = Depends(db_session),
 ) -> list[RequisitionResult]:
-    """近期领料记录（最新在前）。"""
+    """近期领料记录（最新在前），含状态（confirmed/voided）、作废时间与
+    返还张数。"""
     return [RequisitionResult(**r) for r in list_requisitions(conn, limit)]
+
+
+@app.post(
+    "/api/requisitions/{order_no}/void",
+    response_model=RequisitionVoidResult,
+    tags=["stock"],
+)
+def api_requisition_void(
+    order_no: str,
+    conn: sqlite3.Connection = Depends(db_session),
+) -> RequisitionVoidResult:
+    """作废已确认的领料单：按原单实际扣纸页数把对应纸型余量回补，
+    并在原单记录作废时间与返还张数。
+
+    - 库存回补与状态变更在同一 SQLite 事务（BEGIN IMMEDIATE）中提交，
+      不会出现回补了库存却没改状态（或反之）；
+    - 重复点击 / 并发请求只回补一次：已作废的单幂等返回原作废信息
+      （already_voided=true，HTTP 200），余量不再变动；
+    - 单号不存在：HTTP 404；
+    - 作废后的单号不能再次用于确认领料（/api/requisitions 返回 409）。
+    """
+    if not order_no.strip():
+        raise HTTPException(status_code=400, detail="领料单号不能为空。")
+    try:
+        result = void_requisition(conn, order_no)
+    except RequisitionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return RequisitionVoidResult(**result)
 
 
 # 静态资源（index.html / app.js / style.css）
